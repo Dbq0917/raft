@@ -229,23 +229,45 @@ func (r *Raft) runFollower() {
 
 			if r.configurations.latestIndex == 0 {
 				if !didWarn {
-					r.logger.Warn("no known peers, aborting election")
+					r.logger.Warn("no known peers, aborting election",
+						"local-id", r.localID,
+						"latest-config-index", r.configurations.latestIndex,
+						"committed-config-index", r.configurations.committedIndex,
+						"last-log-index", r.getLastIndex(),
+						"election-timeout", r.config().ElectionTimeout)
 					didWarn = true
 				}
 			} else if r.configurations.latestIndex == r.configurations.committedIndex &&
 				!hasVote(r.configurations.latest, r.localID) {
 				if !didWarn {
-					r.logger.Warn("not part of stable configuration, aborting election")
+					r.logger.Warn("not part of stable configuration, aborting election",
+						"local-id", r.localID,
+						"latest-config-index", r.configurations.latestIndex,
+						"committed-config-index", r.configurations.committedIndex,
+						"voters", voterIDs(r.configurations.latest),
+						"election-timeout", r.config().ElectionTimeout)
 					didWarn = true
 				}
 			} else {
 				metrics.IncrCounter([]string{"raft", "transition", "heartbeat_timeout"}, 1)
 				if hasVote(r.configurations.latest, r.localID) {
-					r.logger.Warn("heartbeat timeout reached, starting election", "last-leader-addr", lastLeaderAddr, "last-leader-id", lastLeaderID)
+					r.logger.Warn("heartbeat timeout reached, starting election",
+						"last-leader-addr", lastLeaderAddr,
+						"last-leader-id", lastLeaderID,
+						"local-id", r.localID,
+						"term", r.getCurrentTerm(),
+						"voters", voterIDs(r.configurations.latest),
+						"votes-needed", r.quorumSize(),
+						"election-timeout", r.config().ElectionTimeout)
 					r.setState(Candidate)
 					return
 				} else if !didWarn {
-					r.logger.Warn("heartbeat timeout reached, not part of a stable configuration or a non-voter, not triggering a leader election")
+					r.logger.Warn("heartbeat timeout reached, not part of a stable configuration or a non-voter, not triggering a leader election",
+						"local-id", r.localID,
+						"latest-config-index", r.configurations.latestIndex,
+						"committed-config-index", r.configurations.committedIndex,
+						"voters", voterIDs(r.configurations.latest),
+						"election-timeout", r.config().ElectionTimeout)
 					didWarn = true
 				}
 			}
@@ -285,7 +307,17 @@ func (r *Raft) liveBootstrap(configuration Configuration) error {
 // runCandidate runs the main loop while in the candidate state.
 func (r *Raft) runCandidate() {
 	term := r.getCurrentTerm() + 1
-	r.logger.Info("entering candidate state", "node", r, "term", term)
+	lastLogIndex, lastLogTerm := r.getLastEntry()
+	r.logger.Info("entering candidate state",
+		"node", r,
+		"term", term,
+		"local-id", r.localID,
+		"voters", voterIDs(r.configurations.latest),
+		"votes-needed", r.quorumSize(),
+		"last-log-index", lastLogIndex,
+		"last-log-term", lastLogTerm,
+		"election-timeout", r.config().ElectionTimeout,
+		"pre-vote", !r.preVoteDisabled)
 	metrics.IncrCounter([]string{"raft", "state", "candidate"}, 1)
 
 	// Start vote for us, and set a timeout
@@ -431,7 +463,16 @@ func (r *Raft) runCandidate() {
 			r.mainThreadSaturation.working()
 			// Election failed! Restart the election. We simply return,
 			// which will kick us back into runCandidate
-			r.logger.Warn("Election timeout reached, restarting election")
+			r.logger.Warn("Election timeout reached, restarting election",
+				"local-id", r.localID,
+				"term", term,
+				"votes-needed", votesNeeded,
+				"pre-vote-granted", preVoteGrantedVotes,
+				"pre-vote-refused", preVoteRefusedVotes,
+				"votes-granted", grantedVotes,
+				"voters", voterIDs(r.configurations.latest),
+				"last-log-index", r.getLastIndex(),
+				"election-timeout", electionTimeout)
 			return
 
 		case <-r.shutdownCh:

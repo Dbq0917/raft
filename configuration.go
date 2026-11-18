@@ -176,6 +176,20 @@ func hasVote(configuration Configuration, id ServerID) bool {
 	return false
 }
 
+// voterIDs returns the IDs of all voting servers in a configuration. It is
+// used to make election diagnostics self-describing: when a node is stuck in
+// candidate state the logged voter set shows immediately whether the local
+// node is present and which peers the quorum is computed from.
+func voterIDs(configuration Configuration) []ServerID {
+	voters := make([]ServerID, 0, len(configuration.Servers))
+	for _, server := range configuration.Servers {
+		if server.Suffrage == Voter {
+			voters = append(voters, server.ID)
+		}
+	}
+	return voters
+}
+
 // inConfiguration returns true if the server identified by 'id' is in the
 // provided Configuration.
 func inConfiguration(configuration Configuration, id ServerID) bool {
