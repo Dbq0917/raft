@@ -5,6 +5,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -15,23 +16,44 @@ var _ CommitTrackingLogStore = &InmemCommitTrackingStore{}
 // It should NOT EVER be used for production. It is used only for
 // unit tests. Use the MDBStore implementation instead.
 type InmemStore struct {
+	storeFail atomic.Bool
+	storeSem  chan struct{}
+
 	l         sync.RWMutex
 	lowIndex  uint64
 	highIndex uint64
 	logs      map[uint64]*Log
 	kv        map[string][]byte
 	kvInt     map[string]uint64
+	monotonic bool
 }
 
 // NewInmemStore returns a new in-memory backend. Do not ever
 // use for production. Only for testing.
 func NewInmemStore() *InmemStore {
 	i := &InmemStore{
-		logs:  make(map[uint64]*Log),
-		kv:    make(map[string][]byte),
-		kvInt: make(map[string]uint64),
+		storeSem: make(chan struct{}, 1),
+		logs:     make(map[uint64]*Log),
+		kv:       make(map[string][]byte),
+		kvInt:    make(map[string]uint64),
 	}
 	return i
+}
+
+// BlockStore causes subsequent StoreLog and StoreLogs calls to block until the
+// returned function is called.
+func (i *InmemStore) BlockStore() func() {
+	i.storeSem <- struct{}{}
+	var once sync.Once
+	return func() {
+		once.Do(func() { <-i.storeSem })
+	}
+}
+
+// FailNext makes the next StoreLog or StoreLogs call return an error without
+// modifying the store.
+func (i *InmemStore) FailNext() {
+	i.storeFail.Store(true)
 }
 
 // FirstIndex implements the LogStore interface.
@@ -67,9 +89,20 @@ func (i *InmemStore) StoreLog(log *Log) error {
 
 // StoreLogs implements the LogStore interface.
 func (i *InmemStore) StoreLogs(logs []*Log) error {
+	i.storeSem <- struct{}{}
+	defer func() { <-i.storeSem }()
+
+	if i.storeFail.Swap(false) {
+		return errors.New("IO error")
+	}
+
 	i.l.Lock()
 	defer i.l.Unlock()
 	for _, l := range logs {
+		if i.monotonic && l.Index != i.highIndex+1 {
+			return fmt.Errorf("non-monotonic write, log index: %d, last index %d, batch range: [%d, %d]",
+				l.Index, i.highIndex, logs[0].Index, logs[len(logs)-1].Index)
+		}
 		i.logs[l.Index] = l
 		if i.lowIndex == 0 {
 			i.lowIndex = l.Index
@@ -133,6 +166,13 @@ func (i *InmemStore) GetUint64(key []byte) (uint64, error) {
 	i.l.RLock()
 	defer i.l.RUnlock()
 	return i.kvInt[string(key)], nil
+}
+
+// SetMonotonic controls whether the store rejects non-contiguous writes.
+func (i *InmemStore) SetMonotonic(v bool) {
+	i.l.Lock()
+	defer i.l.Unlock()
+	i.monotonic = v
 }
 
 type InmemCommitTrackingStore struct {

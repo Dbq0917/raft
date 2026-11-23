@@ -142,6 +142,40 @@ type MonotonicLogStore interface {
 	IsMonotonic() bool
 }
 
+// LogWriteCompletion reports the result of an asynchronous log write.
+//
+// PersistentIndex is the highest log index that is safely stored in the
+// underlying LogStore. If Error is non-nil, PersistentIndex is the last index
+// that was known to be durable before the failed write.
+type LogWriteCompletion struct {
+	PersistentIndex uint64
+	Error           error
+	Duration        time.Duration
+}
+
+// AsyncLogStore is an optional interface for LogStore implementations that can
+// make appends immediately readable while persisting them in the background.
+//
+// Raft uses this to write the leader's log in parallel with replication. The
+// leader does not count its own append towards the commit quorum until the
+// corresponding LogWriteCompletion reports that it is durable.
+type AsyncLogStore interface {
+	LogStore
+
+	// EnableAsync puts the store in asynchronous mode. Completions must be
+	// delivered on the provided channel. Implementations may block on sending a
+	// completion to provide backpressure.
+	EnableAsync(chan<- LogWriteCompletion)
+
+	// DisableAsync waits for all writes accepted in asynchronous mode to become
+	// durable and returns the store to synchronous mode.
+	DisableAsync()
+
+	// StoreLogsAsync makes logs readable and queues them for durable storage.
+	// Logs must be accepted in index order.
+	StoreLogsAsync(logs []*Log) error
+}
+
 func oldestLog(s LogStore) (Log, error) {
 	var l Log
 

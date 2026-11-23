@@ -95,6 +95,7 @@ type leaderState struct {
 	replState                    map[ServerID]*followerReplication
 	notify                       map[*verifyFuture]struct{}
 	stepDown                     chan struct{}
+	logWriteCompletionCh         chan LogWriteCompletion
 }
 
 // setLeader is used to modify the current leader Address and ID of the cluster
@@ -462,6 +463,12 @@ func (r *Raft) setupLeaderState() {
 	r.leaderState.replState = make(map[ServerID]*followerReplication)
 	r.leaderState.notify = make(map[*verifyFuture]struct{})
 	r.leaderState.stepDown = make(chan struct{}, 1)
+
+	if asyncStore, ok := r.logs.(AsyncLogStore); ok {
+		r.leaderState.logWriteCompletionCh = make(chan LogWriteCompletion, 1)
+		asyncStore.EnableAsync(r.leaderState.logWriteCompletionCh)
+		r.logger.Debug("enabling async mode on log store")
+	}
 }
 
 // runLeader runs the main loop while in leader state. Do the setup here and drop into
@@ -526,6 +533,11 @@ func (r *Raft) runLeader() {
 		}
 
 		// Clear all the state
+		if r.leaderState.logWriteCompletionCh != nil {
+			r.logs.(AsyncLogStore).DisableAsync()
+			r.leaderState.logWriteCompletionCh = nil
+			r.logger.Debug("disabling async mode on log store")
+		}
 		r.leaderState.commitCh = nil
 		r.leaderState.commitment = nil
 		r.leaderState.inflight = nil
@@ -932,6 +944,16 @@ func (r *Raft) leaderLoop() {
 				r.dispatchLogs(ready)
 			}
 
+		case lwc := <-r.leaderState.logWriteCompletionCh:
+			r.mainThreadSaturation.working()
+			if lwc.Error != nil {
+				r.logger.Error("failed to sync logs to disk", "error", lwc.Error)
+				r.setState(Follower)
+				continue
+			}
+			metrics.AddSample([]string{"raft", "asyncFlush"}, float32(lwc.Duration.Milliseconds()))
+			r.leaderState.commitment.match(r.localID, lwc.PersistentIndex)
+
 		case <-lease:
 			r.mainThreadSaturation.working()
 			// Check if we've exceeded the lease, potentially stepping down
@@ -1266,8 +1288,7 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	commitIndex := r.getCommitIndex()
 	r.tryStageCommitIndex(commitIndex)
 
-	// Write the log entry locally
-	if err := r.logs.StoreLogs(logs); err != nil {
+	onWriteErr := func(err error) {
 		r.logger.Error("failed to commit logs", "error", err)
 		for _, applyLog := range applyLogs {
 			applyLog.respond(err)
@@ -1275,9 +1296,24 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 		r.setState(Follower)
 		return
 	}
-	r.leaderState.commitment.match(r.localID, lastIndex)
 
-	// Update the last log since it's on disk now
+	// Write the log entry locally. Async stores make the entries readable
+	// before they are durable so replication can start immediately. In that
+	// case the local match is advanced by the completion handler in leaderLoop.
+	if asyncStore, ok := r.logs.(AsyncLogStore); ok {
+		if err := asyncStore.StoreLogsAsync(logs); err != nil {
+			onWriteErr(err)
+			return
+		}
+	} else {
+		if err := r.logs.StoreLogs(logs); err != nil {
+			onWriteErr(err)
+			return
+		}
+		r.leaderState.commitment.match(r.localID, lastIndex)
+	}
+
+	// The logs are now readable, even if they are still being persisted.
 	r.setLastLog(lastIndex, term)
 
 	// Notify the replicators of the new log

@@ -3,6 +3,9 @@
 IMPROVEMENETS
 
 * Added a flag to skip legacy duplicate telemetry. [GH-630](https://github.com/hashicorp/raft/pull/630)
+* Added `AsyncLogStore` and `LogCacheAsync` so a leader can replicate entries while its
+  local log store persists them in the background, without advancing the leader's
+  durable match index early.
 
 # 1.7.0 (June 5th, 2024)
 
