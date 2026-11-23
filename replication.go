@@ -247,7 +247,7 @@ START:
 	// Update s based on success
 	if resp.Success {
 		// Update our replication state
-		updateLastAppended(s, &req)
+		r.updateLastAppended(s, &req)
 
 		// Clear any failures, allow pipelining
 		s.failures = 0
@@ -311,6 +311,10 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
 
 	// Open the most recent snapshot
 	snapID := snapshots[0].ID
+	// Mark the peer as recovering before opening the snapshot so a concurrent
+	// compaction cannot remove the logs it will need after installation.
+	r.markPeerRecovering(s.peer.ID, snapshots[0].Index)
+
 	r.logger.Info("opening snapshot", "id", snapID)
 	meta, snapshot, err := r.snapshots.Open(snapID)
 	if err != nil {
@@ -369,6 +373,7 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
 		// Update the indexes
 		atomic.StoreUint64(&s.nextIndex, meta.Index+1)
 		s.commitment.match(peer.ID, meta.Index)
+		r.updateRecoveringPeer(peer.ID, meta.Index)
 
 		// Clear any failures
 		s.failures = 0
@@ -559,7 +564,7 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 			}
 
 			// Update our replication state
-			updateLastAppended(s, req)
+			r.updateLastAppended(s, req)
 		case <-stopCh:
 			return
 		}
@@ -652,12 +657,13 @@ func (r *Raft) handleStaleTerm(s *followerReplication) {
 // updateLastAppended is used to update follower replication state after a
 // successful AppendEntries RPC.
 // TODO: This isn't used during InstallSnapshot, but the code there is similar.
-func updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {
+func (r *Raft) updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {
 	// Mark any inflight logs as committed
 	if logs := req.Entries; len(logs) > 0 {
 		last := logs[len(logs)-1]
 		atomic.StoreUint64(&s.nextIndex, last.Index+1)
 		s.commitment.match(s.peer.ID, last.Index)
+		r.updateRecoveringPeer(s.peer.ID, last.Index)
 	}
 
 	// Notify still leader

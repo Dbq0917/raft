@@ -39,11 +39,12 @@ type inmemPipelineInflight struct {
 // tested in-memory without going over a network.
 type InmemTransport struct {
 	sync.RWMutex
-	consumerCh chan RPC
-	localAddr  ServerAddress
-	peers      map[ServerAddress]*InmemTransport
-	pipelines  []*inmemPipeline
-	timeout    time.Duration
+	consumerCh           chan RPC
+	localAddr            ServerAddress
+	peers                map[ServerAddress]*InmemTransport
+	pipelines            []*inmemPipeline
+	timeout              time.Duration
+	installSnapshotDelay <-chan struct{}
 }
 
 // NewInmemTransportWithTimeout is used to initialize a new transport and
@@ -67,6 +68,16 @@ func NewInmemTransportWithTimeout(addr ServerAddress, timeout time.Duration) (Se
 // and generates a random local address if none is specified
 func NewInmemTransport(addr ServerAddress) (ServerAddress, *InmemTransport) {
 	return NewInmemTransportWithTimeout(addr, 500*time.Millisecond)
+}
+
+// DelayInstallSnapshot registers a channel that InstallSnapshot blocks on
+// before sending or delivering a snapshot. It is useful for tests that need to
+// simulate a large, slow snapshot transfer while the leader keeps appending
+// logs.
+func (i *InmemTransport) DelayInstallSnapshot(ch <-chan struct{}) {
+	i.Lock()
+	defer i.Unlock()
+	i.installSnapshotDelay = ch
 }
 
 // SetHeartbeatHandler is used to set optional fast-path for
@@ -139,6 +150,13 @@ func (i *InmemTransport) RequestPreVote(id ServerID, target ServerAddress, args 
 
 // InstallSnapshot implements the Transport interface.
 func (i *InmemTransport) InstallSnapshot(id ServerID, target ServerAddress, args *InstallSnapshotRequest, resp *InstallSnapshotResponse, data io.Reader) error {
+	i.RLock()
+	delay := i.installSnapshotDelay
+	i.RUnlock()
+	if delay != nil {
+		<-delay
+	}
+
 	rpcResp, err := i.makeRPC(target, args, data, 10*i.timeout)
 	if err != nil {
 		return err
@@ -171,6 +189,17 @@ func (i *InmemTransport) makeRPC(target ServerAddress, args interface{}, r io.Re
 	if !ok {
 		err = fmt.Errorf("failed to connect to peer: %v", target)
 		return
+	}
+
+	// Also honor a delay configured on the receiving transport so tests can
+	// block the transfer from either side.
+	if _, ok := args.(*InstallSnapshotRequest); ok {
+		peer.RLock()
+		delay := peer.installSnapshotDelay
+		peer.RUnlock()
+		if delay != nil {
+			<-delay
+		}
 	}
 
 	// Send the RPC over

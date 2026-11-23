@@ -255,8 +255,16 @@ func (r *Raft) compactLogs(snapIdx uint64) error {
 
 	lastLogIdx, _ := r.getLastLog()
 	trailingLogs := r.config().TrailingLogs
+	maxLog := snapIdx
 
-	return r.compactLogsWithTrailing(snapIdx, lastLogIdx, trailingLogs)
+	// Don't compact logs a follower still needs to catch up incrementally after
+	// installing a snapshot. Keep the last entry the follower is known to have
+	// as a conservative boundary.
+	if recoveringIdx := r.lowestRecoveringPeerIndex(); recoveringIdx > 0 {
+		maxLog = min(maxLog, recoveringIdx-1)
+	}
+
+	return r.compactLogsWithTrailing(maxLog, lastLogIdx, trailingLogs)
 }
 
 // removeOldLogs removes all old logs from the store. This is used for

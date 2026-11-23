@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -95,6 +96,17 @@ type leaderState struct {
 	replState                    map[ServerID]*followerReplication
 	notify                       map[*verifyFuture]struct{}
 	stepDown                     chan struct{}
+
+	// recoveringPeers tracks followers which are currently receiving a
+	// snapshot. The value is the highest log index the follower is known to
+	// have. Logs after that index must be retained until the follower catches
+	// up, otherwise a long snapshot transfer can force another full snapshot
+	// when the records appended during the transfer have already been compacted.
+	//
+	// This is separate from replState because it is also read by the snapshot
+	// goroutine while leader state is otherwise owned by the leader loop.
+	recoveringPeers     map[ServerID]uint64
+	recoveringPeersLock sync.Mutex
 }
 
 // setLeader is used to modify the current leader Address and ID of the cluster
@@ -462,6 +474,7 @@ func (r *Raft) setupLeaderState() {
 	r.leaderState.replState = make(map[ServerID]*followerReplication)
 	r.leaderState.notify = make(map[*verifyFuture]struct{})
 	r.leaderState.stepDown = make(chan struct{}, 1)
+	r.leaderState.recoveringPeers = make(map[ServerID]uint64)
 }
 
 // runLeader runs the main loop while in leader state. Do the setup here and drop into
@@ -532,6 +545,9 @@ func (r *Raft) runLeader() {
 		r.leaderState.replState = nil
 		r.leaderState.notify = nil
 		r.leaderState.stepDown = nil
+		r.leaderState.recoveringPeersLock.Lock()
+		r.leaderState.recoveringPeers = nil
+		r.leaderState.recoveringPeersLock.Unlock()
 
 		// If we are stepping down for some reason, no known leader.
 		// We may have stepped down due to an RPC call, which would
@@ -638,6 +654,7 @@ func (r *Raft) startStopReplication() {
 		repl.stopCh <- lastIdx
 		close(repl.stopCh)
 		delete(r.leaderState.replState, serverID)
+		r.clearRecoveringPeer(serverID)
 		r.observe(PeerObservation{Peer: repl.peer, Removed: true})
 	}
 
@@ -2234,6 +2251,66 @@ func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 	r.setState(Candidate)
 	r.candidateFromLeadershipTransfer.Store(true)
 	rpc.Respond(&TimeoutNowResponse{}, nil)
+}
+
+// markPeerRecovering records that a follower is about to install a snapshot at
+// lastIndex. While the snapshot is in flight, log compaction must retain all
+// entries after lastIndex so the follower can catch up incrementally.
+func (r *Raft) markPeerRecovering(id ServerID, lastIndex uint64) {
+	r.leaderState.recoveringPeersLock.Lock()
+	defer r.leaderState.recoveringPeersLock.Unlock()
+
+	if r.leaderState.recoveringPeers == nil {
+		r.leaderState.recoveringPeers = make(map[ServerID]uint64)
+	}
+	if current, ok := r.leaderState.recoveringPeers[id]; !ok || lastIndex > current {
+		r.leaderState.recoveringPeers[id] = lastIndex
+	}
+}
+
+// clearRecoveringPeer stops retaining logs for a follower that is no longer
+// part of the configuration or no longer recovering.
+func (r *Raft) clearRecoveringPeer(id ServerID) {
+	r.leaderState.recoveringPeersLock.Lock()
+	delete(r.leaderState.recoveringPeers, id)
+	r.leaderState.recoveringPeersLock.Unlock()
+}
+
+// updateRecoveringPeer advances the retained-log boundary for a recovering
+// follower. Once the follower is close enough to the head of the log that a
+// normal compaction would preserve everything it still needs, tracking stops.
+func (r *Raft) updateRecoveringPeer(id ServerID, lastIndex uint64) {
+	r.leaderState.recoveringPeersLock.Lock()
+	defer r.leaderState.recoveringPeersLock.Unlock()
+
+	current, ok := r.leaderState.recoveringPeers[id]
+	if !ok || lastIndex < current {
+		return
+	}
+
+	lastLog, _ := r.getLastLog()
+	trailing := r.config().TrailingLogs
+	caughtUp := lastIndex >= lastLog || lastLog-lastIndex <= trailing/2
+	if caughtUp {
+		delete(r.leaderState.recoveringPeers, id)
+		return
+	}
+	r.leaderState.recoveringPeers[id] = lastIndex
+}
+
+// lowestRecoveringPeerIndex returns the lowest log index still needed by a
+// recovering peer, or zero if no peer is recovering.
+func (r *Raft) lowestRecoveringPeerIndex() uint64 {
+	r.leaderState.recoveringPeersLock.Lock()
+	defer r.leaderState.recoveringPeersLock.Unlock()
+
+	var lowest uint64
+	for _, index := range r.leaderState.recoveringPeers {
+		if lowest == 0 || index < lowest {
+			lowest = index
+		}
+	}
+	return lowest
 }
 
 // setLatestConfiguration stores the latest configuration and updates a copy of it.
