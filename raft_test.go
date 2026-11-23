@@ -5,6 +5,7 @@ package raft
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -616,6 +617,173 @@ func TestRaft_JoinNode(t *testing.T) {
 
 	// Check the peers
 	c.EnsureSamePeers(t)
+}
+
+// TestRaft_AddVoter_ElectionBeforeCommit makes sure an in-flight membership
+// change cannot produce two leaders or a divergent log. The configuration
+// entry for adding a server is kept from reaching a majority, and an election
+// is forced while old and new configurations briefly coexist. There must
+// never be two leaders accepting writes, and the cluster must converge to a
+// single identical log once the network heals.
+func TestRaft_AddVoter_ElectionBeforeCommit(t *testing.T) {
+	conf := inmemConfig(t)
+	c := MakeCluster(5, t, conf)
+	defer c.Close()
+
+	oldLeader := c.Leader()
+	oldLeaderAddr := oldLeader.localAddr
+	oldFollowers := c.Followers()
+	require.Len(t, oldFollowers, 4)
+
+	// Apply some baseline writes so the cluster has a committed prefix.
+	for i := 0; i < 5; i++ {
+		future := oldLeader.Apply([]byte(fmt.Sprintf("before-%d", i)), 0)
+		require.NoError(t, future.Error())
+	}
+	c.EnsureSame(t)
+
+	// Build the joining node but keep it out of the cluster for now.
+	joiner := MakeClusterNoBootstrap(1, t, inmemConfig(t))
+	defer joiner.Close()
+	c.Merge(joiner)
+	joinNode := joiner.rafts[0]
+	c.FullyConnect()
+
+	// Watch for any dual-leader window while the config change and election
+	// overlap.
+	dualLeader := make(chan struct{}, 1)
+	watchCtx, cancelWatch := context.WithCancel(context.Background())
+	defer cancelWatch()
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			default:
+			}
+			leaders, _ := c.pollState(Leader)
+			if len(leaders) > 1 {
+				select {
+				case dualLeader <- struct{}{}:
+				default:
+				}
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	// Append the membership change while the cluster is fully connected, then
+	// immediately isolate three of the four followers. The leader keeps one
+	// follower (two voters total), so the configuration entry is appended on
+	// the leader but cannot reach the three-vote majority needed to commit.
+	configFuture := oldLeader.AddVoter(joinNode.localID, joinNode.localAddr, 0, 0)
+	isolatedAddrs := []ServerAddress{
+		oldFollowers[1].localAddr,
+		oldFollowers[2].localAddr,
+		oldFollowers[3].localAddr,
+	}
+	c.Partition(isolatedAddrs)
+
+	// Confirm the uncommitted configuration coexists with the committed one.
+	deadline := time.Now().Add(c.longstopTimeout)
+	var snapshot configurations
+	for time.Now().Before(deadline) {
+		configReq := &configurationsFuture{}
+		configReq.init()
+		oldLeader.configurationsCh <- configReq
+		require.NoError(t, configReq.Error())
+		snapshot = configReq.configurations
+		if snapshot.latestIndex != snapshot.committedIndex {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	require.Greater(t,
+		snapshot.latestIndex,
+		snapshot.committedIndex,
+		"the new configuration must be appended while the old one stays committed")
+	require.Len(t, snapshot.latest.Servers, 6)
+	require.Len(t, snapshot.committed.Servers, 5)
+
+	// The change must not commit successfully without a quorum. It either
+	// stays pending or fails once the isolated leader loses its lease.
+	select {
+	case err := <-futureErr(configFuture):
+		require.Error(t, err, "the membership change must not commit without a quorum")
+	case <-time.After(c.propagateTimeout * 2):
+	}
+
+	// Bring the original followers back together, but keep the old leader
+	// isolated. They share only the old committed configuration and must elect
+	// a single successor.
+	c.FullyConnect()
+	c.Partition([]ServerAddress{oldLeaderAddr})
+
+	isolatedWrite := oldLeader.Apply([]byte("isolated-write"), c.propagateTimeout)
+
+	var newLeader *Raft
+	electionDeadline := time.Now().Add(c.longstopTimeout)
+	for time.Now().Before(electionDeadline) {
+		time.Sleep(c.propagateTimeout)
+		for _, raft := range c.rafts {
+			if raft.localAddr != oldLeaderAddr && raft.State() == Leader {
+				newLeader = raft
+			}
+		}
+		if newLeader != nil {
+			break
+		}
+	}
+	require.NotNil(t, newLeader, "the connected majority should elect a new leader")
+
+	// Writes keep flowing through the new leader while the old one is split.
+	writingFuture := newLeader.Apply([]byte("after-election"), 0)
+	require.NoError(t, writingFuture.Error())
+
+	// Heal the network and let the joiner catch up from the new leader.
+	c.FullyConnect()
+	require.Error(t, isolatedWrite.Error(), "the isolated old leader must not commit a write")
+
+	// Re-issue the membership change under the stable leader.
+	retryFuture := newLeader.AddVoter(joinNode.localID, joinNode.localAddr, 0, 0)
+	select {
+	case err := <-futureErr(retryFuture):
+		require.NoError(t, err)
+	case <-time.After(c.longstopTimeout):
+		t.Fatalf("timed out waiting for the configuration change to finish")
+	}
+
+	cancelWatch()
+	<-watchDone
+	select {
+	case <-dualLeader:
+		t.Fatalf("two leaders were active at the same time during the membership change")
+	default:
+	}
+
+	// The cluster must converge to one leader and one identical log/FSM.
+	stableLeader := c.Leader()
+	c.EnsureLeader(t, stableLeader.localAddr)
+	c.EnsureSame(t)
+	c.EnsureSamePeers(t)
+
+	// The rejected isolated write must never appear in any FSM.
+	for _, fsmRaw := range c.fsms {
+		for _, entry := range getMockFSM(fsmRaw).Logs() {
+			require.NotEqual(t, []byte("isolated-write"), entry)
+		}
+	}
+}
+
+func futureErr(future IndexFuture) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- future.Error()
+	}()
+	return errCh
 }
 
 func TestRaft_JoinNode_ConfigStore(t *testing.T) {
