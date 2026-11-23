@@ -2353,6 +2353,50 @@ func TestRaft_PreVoteAvoidElectionWithPartition(t *testing.T) {
 
 }
 
+func TestRaft_ElectionBackoffOnRepeatedFailures(t *testing.T) {
+	// Pre-vote is disabled so that a partitioned node actually runs
+	// (and fails) real elections while it is cut off.
+	conf := inmemConfig(t)
+	conf.PreVoteDisabled = true
+	c := MakeCluster(3, t, conf)
+	defer c.Close()
+
+	// Partition a follower so that its elections keep failing.
+	followers := c.Followers()
+	require.Len(t, followers, 2)
+	node := followers[0]
+	c.Partition([]ServerAddress{node.localAddr})
+
+	// Wait until the node has failed several elections in a row. With a
+	// 50ms base election timeout this should happen quickly.
+	deadline := time.Now().Add(10 * time.Second)
+	for node.electionBackoff.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	require.GreaterOrEqual(t, node.electionBackoff.Load(), uint64(3),
+		"expected election backoff to grow after repeated failed elections")
+
+	// The backoff must space out re-elections: without it the term would
+	// increase every ~50-100ms, with the capped backoff (up to 8x the base
+	// timeout) the term grows much slower.
+	term := node.getCurrentTerm()
+	time.Sleep(2 * time.Second)
+	termGrowth := node.getCurrentTerm() - term
+	require.Less(t, termGrowth, uint64(10),
+		"expected backoff to slow down re-elections, term grew by %d in 2s", termGrowth)
+
+	// Reconnect the node. Once it hears from a leader again, the backoff
+	// must reset so that a later real crash is detected quickly.
+	c.FullyConnect()
+	deadline = time.Now().Add(10 * time.Second)
+	for node.electionBackoff.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	require.Zero(t, node.electionBackoff.Load(),
+		"expected election backoff to reset after contact with a leader")
+	c.EnsureLeader(t, c.Leader().localAddr)
+}
+
 func TestRaft_VotingGrant_WhenLeaderAvailable(t *testing.T) {
 	conf := inmemConfig(t)
 	conf.ProtocolVersion = 3

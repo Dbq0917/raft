@@ -140,6 +140,13 @@ type Raft struct {
 	// on.
 	candidateFromLeadershipTransfer atomic.Bool
 
+	// electionBackoff counts the number of consecutive failed elections. It
+	// is used to exponentially back off the election timeout so that repeated
+	// election failures (e.g. caused by a flapping network) do not trigger a
+	// storm of re-elections. It is reset once the node hears from a leader or
+	// wins an election.
+	electionBackoff atomic.Uint64
+
 	// Stores our local server ID, used to avoid sending RPCs to ourself
 	localID ServerID
 

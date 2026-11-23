@@ -22,6 +22,14 @@ const (
 	minCheckInterval          = 10 * time.Millisecond
 	oldestLogGaugeInterval    = 10 * time.Second
 	rpcUnexpectedCommandError = "unexpected command"
+
+	// maxElectionBackoffScale caps the exponential backoff applied to the
+	// election timeout after consecutive failed elections. The timeout is
+	// doubled per failure, up to 2^(maxElectionBackoffScale-2) times the
+	// configured ElectionTimeout, so that a flapping network cannot trigger
+	// a storm of re-elections while recovery from a real leader crash is
+	// still reasonably fast.
+	maxElectionBackoffScale = 5
 )
 
 var (
@@ -220,6 +228,9 @@ func (r *Raft) runFollower() {
 			// Check if we have had a successful contact
 			lastContact := r.LastContact()
 			if time.Since(lastContact) < hbTimeout {
+				// The leader is reachable, so any backoff accumulated from
+				// previously failed elections is no longer needed.
+				r.electionBackoff.Store(0)
 				continue
 			}
 
@@ -282,6 +293,19 @@ func (r *Raft) liveBootstrap(configuration Configuration) error {
 	return r.processConfigurationLogEntry(&entry)
 }
 
+// electionTimeout returns the election timeout to use for the current
+// election round. Consecutive failed elections exponentially back off the
+// timeout (up to a capped scale) so that repeated failures, e.g. caused by
+// a flapping network, do not trigger a storm of re-elections, while a real
+// leader crash is still detected within a bounded time.
+func (r *Raft) electionTimeout() time.Duration {
+	timeout := r.config().ElectionTimeout
+	if round := r.electionBackoff.Load(); round > 0 {
+		timeout = backoff(timeout, round, maxElectionBackoffScale)
+	}
+	return timeout
+}
+
 // runCandidate runs the main loop while in the candidate state.
 func (r *Raft) runCandidate() {
 	term := r.getCurrentTerm() + 1
@@ -307,7 +331,7 @@ func (r *Raft) runCandidate() {
 	// otherwise.
 	defer func() { r.candidateFromLeadershipTransfer.Store(false) }()
 
-	electionTimeout := r.config().ElectionTimeout
+	electionTimeout := r.electionTimeout()
 	electionTimer := randomTimeout(electionTimeout)
 
 	// Tally the votes, need a simple majority
@@ -331,6 +355,7 @@ func (r *Raft) runCandidate() {
 			// Check if the term is greater than ours, bail
 			if preVote.Term > term {
 				r.logger.Debug("pre-vote denied: found newer term, falling back to follower", "term", preVote.Term)
+				r.electionBackoff.Store(0)
 				r.setState(Follower)
 				r.setCurrentTerm(preVote.Term)
 				return
@@ -366,6 +391,7 @@ func (r *Raft) runCandidate() {
 			// Check if the term is greater than ours, bail
 			if vote.Term > r.getCurrentTerm() {
 				r.logger.Debug("newer term discovered, fallback to follower", "term", vote.Term)
+				r.electionBackoff.Store(0)
 				r.setState(Follower)
 				r.setCurrentTerm(vote.Term)
 				return
@@ -380,6 +406,7 @@ func (r *Raft) runCandidate() {
 			// Check if we've become the leader
 			if grantedVotes >= votesNeeded {
 				r.logger.Info("election won", "term", vote.Term, "tally", grantedVotes)
+				r.electionBackoff.Store(0)
 				r.setState(Leader)
 				r.setLeader(r.localAddr, r.localID)
 				return
@@ -422,8 +449,8 @@ func (r *Raft) runCandidate() {
 			//  Ignore since we are not the leader
 
 		case <-r.followerNotifyCh:
-			if electionTimeout != r.config().ElectionTimeout {
-				electionTimeout = r.config().ElectionTimeout
+			if timeout := r.electionTimeout(); electionTimeout != timeout {
+				electionTimeout = timeout
 				electionTimer = randomTimeout(electionTimeout)
 			}
 
@@ -431,7 +458,8 @@ func (r *Raft) runCandidate() {
 			r.mainThreadSaturation.working()
 			// Election failed! Restart the election. We simply return,
 			// which will kick us back into runCandidate
-			r.logger.Warn("Election timeout reached, restarting election")
+			round := r.electionBackoff.Add(1)
+			r.logger.Warn("Election timeout reached, restarting election", "backoff-round", round)
 			return
 
 		case <-r.shutdownCh:
