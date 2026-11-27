@@ -76,7 +76,7 @@ func (r *Raft) checkRPCHeader(rpc RPC) error {
 func getSnapshotVersion(protocolVersion ProtocolVersion) SnapshotVersion {
 	// Right now we only have two versions and they are backwards compatible
 	// so we don't need to look at the protocol version.
-	return 1
+	return SnapshotVersionMax
 }
 
 // commitTuple is used to send an index that was committed,
@@ -1107,8 +1107,8 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 
 	// Sanity check the version.
 	version := meta.Version
-	if version < SnapshotVersionMin || version > SnapshotVersionMax {
-		return fmt.Errorf("unsupported snapshot version %d", version)
+	if err := validateSnapshotVersion(version); err != nil {
+		return err
 	}
 
 	// We don't support snapshots while there's a config change
@@ -1848,9 +1848,8 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	}()
 
 	// Sanity check the version
-	if req.SnapshotVersion < SnapshotVersionMin ||
-		req.SnapshotVersion > SnapshotVersionMax {
-		rpcErr = fmt.Errorf("unsupported snapshot version %d", req.SnapshotVersion)
+	if err := validateSnapshotVersion(req.SnapshotVersion); err != nil {
+		rpcErr = err
 		return
 	}
 
@@ -1891,8 +1890,7 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 		}
 		reqConfigurationIndex = req.LastLogIndex
 	}
-	version := getSnapshotVersion(r.protocolVersion)
-	sink, err := r.snapshots.Create(version, req.LastLogIndex, req.LastLogTerm,
+	sink, err := r.snapshots.Create(req.SnapshotVersion, req.LastLogIndex, req.LastLogTerm,
 		reqConfiguration, reqConfigurationIndex, r.trans)
 	if err != nil {
 		r.logger.Error("failed to create snapshot to install", "error", err)

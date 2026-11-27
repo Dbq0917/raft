@@ -115,7 +115,8 @@ const (
 //
 //	these snapshots is encoded in the legacy format which requires decodePeers
 //	to parse. This version of snapshots should only be produced by the
-//	unversioned Raft library.
+//	unversioned Raft library. Metadata without a Version field is interpreted
+//	as this version.
 //
 // 1: New format which adds support for a full configuration structure and its
 //

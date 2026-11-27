@@ -36,9 +36,8 @@ func NewInmemSnapshotStore() *InmemSnapshotStore {
 // Create replaces the stored snapshot with a new one using the given args
 func (m *InmemSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 	configuration Configuration, configurationIndex uint64, trans Transport) (SnapshotSink, error) {
-	// We only support version 1 snapshots at this time.
-	if version != 1 {
-		return nil, fmt.Errorf("unsupported snapshot version %d", version)
+	if err := validateSnapshotVersion(version); err != nil {
+		return nil, err
 	}
 
 	name := snapshotName(term, index)
@@ -72,6 +71,9 @@ func (m *InmemSnapshotStore) List() ([]*SnapshotMeta, error) {
 	if !m.hasSnapshot {
 		return []*SnapshotMeta{}, nil
 	}
+	if err := validateSnapshotVersion(m.latest.meta.Version); err != nil {
+		return nil, err
+	}
 	return []*SnapshotMeta{&m.latest.meta}, nil
 }
 
@@ -82,6 +84,9 @@ func (m *InmemSnapshotStore) Open(id string) (*SnapshotMeta, io.ReadCloser, erro
 
 	if m.latest.meta.ID != id {
 		return nil, nil, fmt.Errorf("[ERR] snapshot: failed to open snapshot id: %s", id)
+	}
+	if err := validateSnapshotVersion(m.latest.meta.Version); err != nil {
+		return nil, nil, err
 	}
 
 	// Make a copy of the contents, since a bytes.Buffer can only be read

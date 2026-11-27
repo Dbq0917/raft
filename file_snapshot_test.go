@@ -5,10 +5,14 @@ package raft
 
 import (
 	"bytes"
+	"encoding/json"
+	"hash/crc64"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -156,6 +160,149 @@ func TestFileSS_CreateSnapshot(t *testing.T) {
 	// Ensure a match
 	if !bytes.Equal(buf.Bytes(), []byte("first\nsecond\n")) {
 		t.Fatalf("content mismatch")
+	}
+}
+
+func TestFileSS_CreateSnapshotVersion(t *testing.T) {
+	dir := t.TempDir()
+	snap, err := NewFileSnapshotStoreWithLogger(dir, 3, newTestLogger(t))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	for _, version := range []SnapshotVersion{0, SnapshotVersionMax} {
+		_, trans := NewInmemTransport(NewInmemAddr())
+		sink, err := snap.Create(version, uint64(version+10), 3, Configuration{}, 0, trans)
+		if err != nil {
+			t.Fatalf("version %d: %v", version, err)
+		}
+		if _, err := sink.Write([]byte("state")); err != nil {
+			t.Fatalf("version %d: %v", version, err)
+		}
+		if err := sink.Close(); err != nil {
+			t.Fatalf("version %d: %v", version, err)
+		}
+
+		metaPath := filepath.Join(dir, snapPath, sink.ID(), metaFilePath)
+		metaData, err := os.ReadFile(metaPath)
+		if err != nil {
+			t.Fatalf("version %d: %v", version, err)
+		}
+		var onDisk map[string]interface{}
+		if err := json.Unmarshal(metaData, &onDisk); err != nil {
+			t.Fatalf("version %d: %v", version, err)
+		}
+		if onDisk["Version"] != float64(version) {
+			t.Fatalf("version %d: metadata has version %v", version, onDisk["Version"])
+		}
+
+		meta, source, err := snap.Open(sink.ID())
+		if err != nil {
+			t.Fatalf("version %d: %v", version, err)
+		}
+		if meta.Version != version {
+			t.Fatalf("version %d: got version %d", version, meta.Version)
+		}
+		_ = source.Close()
+	}
+}
+
+func TestFileSS_CreateUnsupportedSnapshotVersion(t *testing.T) {
+	dir := t.TempDir()
+	snap, err := NewFileSnapshotStoreWithLogger(dir, 3, newTestLogger(t))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	_, trans := NewInmemTransport(NewInmemAddr())
+	version := SnapshotVersion(SnapshotVersionMax + 1)
+	_, err = snap.Create(version, 10, 3, Configuration{}, 0, trans)
+	if err == nil {
+		t.Fatalf("expected unsupported snapshot version error")
+	}
+	if !strings.Contains(err.Error(), "unsupported snapshot version 2") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestFileSS_LegacySnapshotWithoutVersion(t *testing.T) {
+	dir := t.TempDir()
+	const id = "1-10-123"
+	state := []byte("legacy state")
+
+	meta := struct {
+		ID    string
+		Index uint64
+		Term  uint64
+		Peers []byte
+		Size  int64
+		CRC   []byte
+	}{
+		ID:    id,
+		Index: 10,
+		Term:  1,
+		Size:  int64(len(state)),
+		CRC:   snapshotCRCForTest(state),
+	}
+	writeFileSnapshotForTest(t, dir, id, meta, state)
+
+	snap, err := NewFileSnapshotStoreWithLogger(dir, 3, newTestLogger(t))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	snaps, err := snap.List()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("expected one snapshot, got %d", len(snaps))
+	}
+	if snaps[0].Version != 0 {
+		t.Fatalf("expected legacy version 0, got %d", snaps[0].Version)
+	}
+
+	opened, source, err := snap.Open(id)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer func() { _ = source.Close() }()
+	if opened.Version != 0 {
+		t.Fatalf("expected legacy version 0, got %d", opened.Version)
+	}
+}
+
+func TestFileSS_UnsupportedSnapshotVersion(t *testing.T) {
+	dir := t.TempDir()
+	const id = "2-10-123"
+	state := []byte("future state")
+
+	meta := struct {
+		Version int
+		ID      string
+		Index   uint64
+		Term    uint64
+		Peers   []byte
+		Size    int64
+		CRC     []byte
+	}{
+		Version: 2,
+		ID:      id,
+		Index:   10,
+		Term:    2,
+		Size:    int64(len(state)),
+		CRC:     snapshotCRCForTest(state),
+	}
+	writeFileSnapshotForTest(t, dir, id, meta, state)
+
+	snap, err := NewFileSnapshotStoreWithLogger(dir, 3, newTestLogger(t))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if _, err := snap.List(); err == nil || !strings.Contains(err.Error(), "unsupported snapshot version 2") {
+		t.Fatalf("unexpected list error: %v", err)
+	}
+	if _, _, err := snap.Open(id); err == nil || !strings.Contains(err.Error(), "unsupported snapshot version 2") {
+		t.Fatalf("unexpected open error: %v", err)
 	}
 }
 
@@ -343,4 +490,31 @@ func TestFileSS_Ordering(t *testing.T) {
 	if snaps[1].Term != 5 {
 		t.Fatalf("bad snap: %#v", *snaps[1])
 	}
+}
+
+func writeFileSnapshotForTest(t *testing.T, base, id string, meta interface{}, state []byte) {
+	t.Helper()
+
+	dir := filepath.Join(base, snapPath, id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	metaData, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, metaFilePath), metaData, 0o644); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, stateFilePath), state, 0o644); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func snapshotCRCForTest(state []byte) []byte {
+	stateHash := crc64.New(crc64.MakeTable(crc64.ECMA))
+	_, _ = stateHash.Write(state)
+	return stateHash.Sum(nil)
 }

@@ -67,6 +67,123 @@ type fileSnapshotMeta struct {
 	CRC []byte
 }
 
+// The version-specific metadata structures make the on-disk format explicit
+// for each version we support. Fields introduced in a later version must only
+// be added to that version's structure.
+type fileSnapshotMetaV0 struct {
+	Version SnapshotVersion
+	ID      string
+	Index   uint64
+	Term    uint64
+	Peers   []byte
+	Size    int64
+	CRC     []byte
+}
+
+type fileSnapshotMetaV1 struct {
+	Version            SnapshotVersion
+	ID                 string
+	Index              uint64
+	Term               uint64
+	Peers              []byte
+	Configuration      Configuration
+	ConfigurationIndex uint64
+	Size               int64
+	CRC                []byte
+}
+
+func decodeFileSnapshotMeta(data []byte) (*fileSnapshotMeta, error) {
+	// Version did not exist in legacy metadata, so a missing marker means
+	// version 0. We still need to distinguish that from an explicit unsupported
+	// version before decoding the rest of the metadata.
+	var marker struct {
+		Version *SnapshotVersion
+	}
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return nil, err
+	}
+
+	version := SnapshotVersion(0)
+	if marker.Version != nil {
+		version = *marker.Version
+	}
+	if err := validateSnapshotVersion(version); err != nil {
+		return nil, err
+	}
+
+	switch version {
+	case 0:
+		var meta fileSnapshotMetaV0
+		if err := json.Unmarshal(data, &meta); err != nil {
+			return nil, err
+		}
+		return &fileSnapshotMeta{
+			SnapshotMeta: SnapshotMeta{
+				Version: version,
+				ID:      meta.ID,
+				Index:   meta.Index,
+				Term:    meta.Term,
+				Peers:   meta.Peers,
+				Size:    meta.Size,
+			},
+			CRC: meta.CRC,
+		}, nil
+
+	case 1:
+		var meta fileSnapshotMetaV1
+		if err := json.Unmarshal(data, &meta); err != nil {
+			return nil, err
+		}
+		return &fileSnapshotMeta{
+			SnapshotMeta: SnapshotMeta{
+				Version:            version,
+				ID:                 meta.ID,
+				Index:              meta.Index,
+				Term:               meta.Term,
+				Peers:              meta.Peers,
+				Configuration:      meta.Configuration,
+				ConfigurationIndex: meta.ConfigurationIndex,
+				Size:               meta.Size,
+			},
+			CRC: meta.CRC,
+		}, nil
+
+	default:
+		return nil, &snapshotVersionError{version: version}
+	}
+}
+
+func encodeFileSnapshotMeta(meta *fileSnapshotMeta) (interface{}, error) {
+	switch meta.Version {
+	case 0:
+		return &fileSnapshotMetaV0{
+			Version: meta.Version,
+			ID:      meta.ID,
+			Index:   meta.Index,
+			Term:    meta.Term,
+			Peers:   meta.Peers,
+			Size:    meta.Size,
+			CRC:     meta.CRC,
+		}, nil
+
+	case 1:
+		return &fileSnapshotMetaV1{
+			Version:            meta.Version,
+			ID:                 meta.ID,
+			Index:              meta.Index,
+			Term:               meta.Term,
+			Peers:              meta.Peers,
+			Configuration:      meta.Configuration,
+			ConfigurationIndex: meta.ConfigurationIndex,
+			Size:               meta.Size,
+			CRC:                meta.CRC,
+		}, nil
+
+	default:
+		return nil, &snapshotVersionError{version: meta.Version}
+	}
+}
+
 // bufferedFile is returned when we open a snapshot. This way
 // reads are buffered and the file still gets closed.
 type bufferedFile struct {
@@ -159,9 +276,8 @@ func snapshotName(term, index uint64) string {
 // Create is used to start a new snapshot
 func (f *FileSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 	configuration Configuration, configurationIndex uint64, trans Transport) (SnapshotSink, error) {
-	// We only support version 1 snapshots at this time.
-	if version != 1 {
-		return nil, fmt.Errorf("unsupported snapshot version %d", version)
+	if err := validateSnapshotVersion(version); err != nil {
+		return nil, err
 	}
 
 	// Create a new path
@@ -268,13 +384,14 @@ func (f *FileSnapshotStore) getSnapshots() ([]*fileSnapshotMeta, error) {
 		// Try to read the meta data
 		meta, err := f.readMeta(dirName)
 		if err != nil {
+			// A snapshot with an unsupported version is not something we can
+			// safely ignore: it may be newer than this node and contain data
+			// that supersedes the snapshots we can read.
+			if isUnsupportedSnapshotVersion(err) {
+				f.logger.Error("snapshot version not supported", "name", dirName, "error", err)
+				return nil, err
+			}
 			f.logger.Warn("failed to read metadata", "name", dirName, "error", err)
-			continue
-		}
-
-		// Make sure we can understand this version.
-		if meta.Version < SnapshotVersionMin || meta.Version > SnapshotVersionMax {
-			f.logger.Warn("snapshot version not supported", "name", dirName, "version", meta.Version)
 			continue
 		}
 
@@ -298,16 +415,11 @@ func (f *FileSnapshotStore) readMeta(name string) (*fileSnapshotMeta, error) {
 	}
 	defer func() { _ = fh.Close() }()
 
-	// Buffer the file IO
-	buffered := bufio.NewReader(fh)
-
-	// Read in the JSON
-	meta := &fileSnapshotMeta{}
-	dec := json.NewDecoder(buffered)
-	if err := dec.Decode(meta); err != nil {
+	data, err := io.ReadAll(fh)
+	if err != nil {
 		return nil, err
 	}
-	return meta, nil
+	return decodeFileSnapshotMeta(data)
 }
 
 // Open takes a snapshot ID and returns a ReadCloser for that snapshot.
@@ -512,9 +624,14 @@ func (s *FileSnapshotSink) writeMeta() error {
 	// Buffer the file IO
 	buffered := bufio.NewWriter(fh)
 
+	meta, err := encodeFileSnapshotMeta(&s.meta)
+	if err != nil {
+		return err
+	}
+
 	// Write out as JSON
 	enc := json.NewEncoder(buffered)
-	if err = enc.Encode(&s.meta); err != nil {
+	if err = enc.Encode(meta); err != nil {
 		return err
 	}
 

@@ -31,6 +31,9 @@ func NewDiscardSnapshotStore() *DiscardSnapshotStore {
 // always discards the snapshot.
 func (d *DiscardSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 	configuration Configuration, configurationIndex uint64, trans Transport) (SnapshotSink, error) {
+	if err := validateSnapshotVersion(version); err != nil {
+		return nil, err
+	}
 	return &DiscardSnapshotSink{}, nil
 }
 

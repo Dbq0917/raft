@@ -39,6 +39,30 @@ type SnapshotMeta struct {
 	Size int64
 }
 
+type snapshotVersionError struct {
+	version SnapshotVersion
+}
+
+func (e *snapshotVersionError) Error() string {
+	return fmt.Sprintf("unsupported snapshot version %d", e.version)
+}
+
+func isSnapshotVersionSupported(version SnapshotVersion) bool {
+	return version >= SnapshotVersionMin && version <= SnapshotVersionMax
+}
+
+func validateSnapshotVersion(version SnapshotVersion) error {
+	if !isSnapshotVersionSupported(version) {
+		return &snapshotVersionError{version: version}
+	}
+	return nil
+}
+
+func isUnsupportedSnapshotVersion(err error) bool {
+	var versionErr *snapshotVersionError
+	return errors.As(err, &versionErr)
+}
+
 // SnapshotStore interface is used to allow for flexible implementations
 // of snapshot storage and retrieval. For example, a client could implement
 // a shared state store such as S3, allowing new nodes to restore snapshots
