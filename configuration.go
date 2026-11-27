@@ -191,7 +191,7 @@ func inConfiguration(configuration Configuration, id ServerID) bool {
 // errors.
 func checkConfiguration(configuration Configuration) error {
 	idSet := make(map[ServerID]bool)
-	addressSet := make(map[ServerAddress]bool)
+	addressOwner := make(map[ServerAddress]ServerID)
 	var voters int
 	for _, server := range configuration.Servers {
 		if server.ID == "" {
@@ -204,16 +204,28 @@ func checkConfiguration(configuration Configuration) error {
 			return fmt.Errorf("found duplicate ID in configuration: %v", server.ID)
 		}
 		idSet[server.ID] = true
-		if addressSet[server.Address] {
-			return fmt.Errorf("found duplicate address in configuration: %v", server.Address)
+		if owner, ok := addressOwner[server.Address]; ok {
+			return fmt.Errorf("found duplicate address in configuration: %v (used by servers %v and %v)", server.Address, owner, server.ID)
 		}
-		addressSet[server.Address] = true
+		addressOwner[server.Address] = server.ID
 		if server.Suffrage == Voter {
 			voters++
 		}
 	}
 	if voters == 0 {
 		return fmt.Errorf("need at least one voter in configuration: %v", configuration)
+	}
+	return nil
+}
+
+// checkAddressAvailable verifies that an address is not already owned by a
+// different server. Reusing the same address for the server being changed is
+// allowed, so an in-place address update remains possible.
+func checkAddressAvailable(configuration Configuration, id ServerID, address ServerAddress) error {
+	for _, server := range configuration.Servers {
+		if server.Address == address && server.ID != id {
+			return fmt.Errorf("found duplicate address in configuration: %v (already used by server %v)", address, server.ID)
+		}
 	}
 	return nil
 }
@@ -229,6 +241,9 @@ func nextConfiguration(current Configuration, currentIndex uint64, change config
 	configuration := current.Clone()
 	switch change.command {
 	case AddVoter:
+		if err := checkAddressAvailable(configuration, change.serverID, change.serverAddress); err != nil {
+			return Configuration{}, err
+		}
 		newServer := Server{
 			Suffrage: Voter,
 			ID:       change.serverID,
@@ -250,6 +265,9 @@ func nextConfiguration(current Configuration, currentIndex uint64, change config
 			configuration.Servers = append(configuration.Servers, newServer)
 		}
 	case AddNonvoter:
+		if err := checkAddressAvailable(configuration, change.serverID, change.serverAddress); err != nil {
+			return Configuration{}, err
+		}
 		newServer := Server{
 			Suffrage: Nonvoter,
 			ID:       change.serverID,

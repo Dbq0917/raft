@@ -119,6 +119,9 @@ func TestConfiguration_checkConfiguration(t *testing.T) {
 	if !strings.Contains(err.Error(), "duplicate address") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	if !strings.Contains(err.Error(), "id0") || !strings.Contains(err.Error(), "id1") {
+		t.Fatalf("duplicate address error should identify both owners: %v", err)
+	}
 }
 
 var singleServer = Configuration{
@@ -296,6 +299,112 @@ func TestConfiguration_nextConfiguration_checkConfiguration(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "at least one voter") {
 		t.Fatalf("nextConfiguration should have failed for not having a voter")
 	}
+}
+
+func TestConfiguration_nextConfiguration_addressConflicts(t *testing.T) {
+	tests := []struct {
+		name    string
+		current Configuration
+		command ConfigurationChangeCommand
+		id      ServerID
+		address ServerAddress
+		owner   ServerID
+	}{
+		{
+			name:    "add voter with existing address",
+			current: singleServer,
+			command: AddVoter,
+			id:      "id2",
+			address: "addr1x",
+			owner:   "id1",
+		},
+		{
+			name:    "move voter onto another server's address",
+			current: voterPair,
+			command: AddVoter,
+			id:      "id1",
+			address: "addr2x",
+			owner:   "id2",
+		},
+		{
+			name:    "add nonvoter with existing address",
+			current: singleServer,
+			command: AddNonvoter,
+			id:      "id2",
+			address: "addr1x",
+			owner:   "id1",
+		},
+		{
+			name:    "move nonvoter onto another server's address",
+			current: oneOfEach,
+			command: AddNonvoter,
+			id:      "id3",
+			address: "addr1x",
+			owner:   "id1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := tt.current.Clone()
+			req := configurationChangeRequest{
+				command:       tt.command,
+				serverID:      tt.id,
+				serverAddress: tt.address,
+			}
+			_, err := nextConfiguration(tt.current, 1, req)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "duplicate address")
+			require.Contains(t, err.Error(), string(tt.owner))
+			require.Equal(t, before, tt.current, "input configuration must not be mutated")
+		})
+	}
+}
+
+func TestConfiguration_nextConfiguration_addressChange(t *testing.T) {
+	const newAddress = ServerAddress("addr1-new")
+
+	next, err := nextConfiguration(voterPair, 1, configurationChangeRequest{
+		command:       AddVoter,
+		serverID:      "id1",
+		serverAddress: newAddress,
+	})
+	require.NoError(t, err)
+	require.Equal(t, Configuration{
+		Servers: []Server{
+			{Suffrage: Voter, ID: "id1", Address: newAddress},
+			{Suffrage: Voter, ID: "id2", Address: "addr2x"},
+		},
+	}, next)
+	require.NoError(t, checkConfiguration(next))
+
+	// Every server receives the same full configuration entry, including the
+	// updated address, so they cannot disagree about where id1 lives.
+	decoded := DecodeConfiguration(EncodeConfiguration(next))
+	require.Equal(t, next, decoded)
+
+	// Once id1 has moved away from its original address, another server may
+	// claim that now-free address.
+	next, err = nextConfiguration(next, 2, configurationChangeRequest{
+		command:       AddVoter,
+		serverID:      "id2",
+		serverAddress: "addr1x",
+	})
+	require.NoError(t, err)
+	require.NoError(t, checkConfiguration(next))
+	require.Equal(t, newAddress, next.Servers[0].Address)
+	require.Equal(t, ServerAddress("addr1x"), next.Servers[1].Address)
+}
+
+func TestConfiguration_nextConfiguration_addressChangeNonvoter(t *testing.T) {
+	next, err := nextConfiguration(oneOfEach, 1, configurationChangeRequest{
+		command:       AddNonvoter,
+		serverID:      "id3",
+		serverAddress: "addr3-new",
+	})
+	require.NoError(t, err)
+	require.Equal(t, ServerAddress("addr3-new"), next.Servers[2].Address)
+	require.NoError(t, checkConfiguration(next))
 }
 
 func TestConfiguration_encodeDecodePeers(t *testing.T) {
